@@ -1,0 +1,290 @@
+--- original/authenticRAG.py
++++ fixed/authenticRAG.py
+@@ -1,4 +1,5 @@
+ import os
++import re
+ import json
+ import numpy as np
+ from pathlib import Path
+@@ -12,21 +13,24 @@
+ from opensearchpy import OpenSearch
+ from sentence_transformers import SentenceTransformer
+ from llama_index.core import Document
+-from llama_index.core.node_parser import MarkdownNodeParser
++from llama_index.core.node_parser import MarkdownNodeParser, SentenceSplitter
++from transformers import AutoTokenizer
+ from langchain.schema import Document as LangchainDocument
+ from langchain_community.document_loaders import TextLoader
+ 
+ class AnthropicStyleContextualRAG:
+     def __init__(self, opensearch_host="localhost", opensearch_port=9200):
+         # รับ API key จาก environment variable
+-        self.api_key = os.environ.get("OPENROUTER_API_KEY")
++        # [F6] ค่าเริ่มต้นยังเป็น Qwen ผ่าน OpenRouter ตามต้นฉบับ แต่เปลี่ยนผู้ให้บริการได้ด้วย LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
++        self.api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+         if not self.api_key:
+-            raise ValueError("OPENROUTER_API_KEY environment variable not set")
+-        
+-        # สร้าง OpenAI client ที่ใช้เรียก Qwen API ผ่าน OpenRouter
++            raise ValueError("OPENROUTER_API_KEY (or LLM_API_KEY) environment variable not set")
++        self.llm_model = os.environ.get("LLM_MODEL", "qwen/qwen-2.5-72b-instruct")
++
++        # สร้าง OpenAI client (OpenRouter หรือผู้ให้บริการอื่นที่รองรับ OpenAI SDK)
+         self.client = OpenAI(
+             api_key=self.api_key,
+-            base_url="https://openrouter.ai/api/v1"
++            base_url=os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+         )
+         
+         # ตั้งค่า embedding model
+@@ -59,12 +63,35 @@
+         # ค่า k สำหรับ RRF
+         self.rrf_k = 60
+ 
+-        # ตั้งค่า MarkdownNodeParser
+-        self.md_parser = MarkdownNodeParser(chunk_size=256)
++        # ตั้งค่าการตัด chunk (MarkdownNodeParser ตัดตามหัวข้อ + SentenceSplitter จำกัดขนาด)
++        self.build_chunker()
+         
+-        # สร้าง indices ถ้ายังไม่มี
++        # tokenizer ของ bge-m3 ใช้นับ token ตอนย่อ context
++        self.tokenizer = self.embed_model.tokenizer
++
++        # [F5] ไม่สร้าง index ตอน __init__ แล้ว: ingest เรียก reset_indices() ให้สร้างใหม่ทุกครั้ง
++        #      (ของเดิมสร้างเฉพาะตอนที่ยังไม่มี -> ถ้ามี index เก่าอยู่ จะใช้ analyzer/chunk ชุดเก่าต่อไปเงียบ ๆ)
++
++    def build_chunker(self, chunk_size=512, chunk_overlap=32):
++        """[F2] MarkdownNodeParser ไม่สนใจ chunk_size (ตัดตามหัวข้ออย่างเดียว) จึงซอยต่อด้วย SentenceSplitter
++        โดยนับ token ด้วย tokenizer ของ bge-m3 ตัวเดียวกับที่ใช้ embed"""
++        tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-m3')
++        self.md_parser = MarkdownNodeParser()
++        self.splitter = SentenceSplitter(
++            chunk_size=chunk_size,
++            chunk_overlap=chunk_overlap,
++            tokenizer=lambda text: tokenizer.encode(text, add_special_tokens=False),
++            # ตัวตัดประโยคค่าเริ่มต้น (NLTK punkt) ใช้กับภาษาอังกฤษ ภาษาไทยใช้ช่องว่าง/ขึ้นบรรทัดคั่นประโยค
++            chunking_tokenizer_fn=lambda text: re.findall(r"\S+\s*", text),
++        )
++
++    def reset_indices(self):
++        """[F5] ลบ index เดิมแล้วสร้างใหม่ ให้ mapping/analyzer และจำนวน chunk ตรงกับโค้ดปัจจุบันเสมอ"""
++        for name in (self.vector_index_name, self.bm25_index_name):
++            if self.opensearch_client.indices.exists(index=name):
++                self.opensearch_client.indices.delete(index=name)
+         self._create_or_update_indices()
+-    
++
+     def _create_or_update_indices(self):
+         """สร้างหรืออัปเดต indices ที่ใช้ในการเก็บ embeddings และ BM25"""
+         # 1. สร้าง vector index
+@@ -93,14 +120,15 @@
+         if not self.opensearch_client.indices.exists(index=self.bm25_index_name):
+             bm25_settings = {
+                 "settings": {
+-                    "analysis": {"analyzer": {"default": {"type": "standard"}}},
++                    # [F1] analyzer "thai" ตัดคำภาษาไทย (standard เก็บทั้งวลีเป็นคำเดียว)
++                    "analysis": {"analyzer": {"default": {"type": "thai"}}},
+                     "similarity": {"default": {"type": "BM25"}},
+                     "index.queries.cache.enabled": False
+                 },
+                 "mappings": {
+                     "properties": {
+-                        "content": {"type": "text", "analyzer": "standard"},
+-                        "contextualized_content": {"type": "text", "analyzer": "standard"},
++                        "content": {"type": "text", "analyzer": "thai"},
++                        "contextualized_content": {"type": "text", "analyzer": "thai"},
+                         "doc_id": {"type": "keyword"},
+                         "chunk_id": {"type": "keyword"},
+                         "original_index": {"type": "integer", "index": False}
+@@ -110,22 +138,29 @@
+             self.opensearch_client.indices.create(index=self.bm25_index_name, body=bm25_settings)
+             print(f"สร้าง BM25 index {self.bm25_index_name} สำเร็จ")
+ 
+-    def call_qwen_api(self, prompt, max_tokens=500, temperature=0.2):
+-        """เรียกใช้ Qwen API เพื่อสร้างข้อความ"""
+-        try:
+-            completion = self.client.chat.completions.create(
+-                model="qwen/qwen-2.5-72b-instruct",
+-                messages=[
+-                    {"role": "system", "content": "You are a helpful assistant."},
+-                    {"role": "user", "content": prompt}
+-                ],
+-                max_tokens=max_tokens,
+-                temperature=temperature
+-            )
+-            return completion.choices[0].message.content
+-        except Exception as e:
+-            print(f"Error calling Qwen API: {e}")
+-            return f"Qwen API error: {str(e)}"
++    def call_qwen_api(self, prompt, max_tokens=500, temperature=0.2, retries=5):
++        """เรียกใช้ LLM API เพื่อสร้างข้อความ
++        [F10] ของเดิม return ข้อความ error เป็นคำตอบ -> ข้อความ "Qwen API error: 429 ..." ถูกเก็บลง index เป็น context
++              ตอนนี้ลองใหม่เมื่อโดน rate limit / server error และ raise ถ้ายังไม่สำเร็จ"""
++        for attempt in range(retries):
++            try:
++                completion = self.client.chat.completions.create(
++                    model=self.llm_model,
++                    messages=[
++                        {"role": "system", "content": "You are a helpful assistant."},
++                        {"role": "user", "content": prompt}
++                    ],
++                    max_tokens=max_tokens,
++                    temperature=temperature
++                )
++                return completion.choices[0].message.content or ""
++            except Exception as e:
++                status = getattr(e, "status_code", None)
++                if attempt == retries - 1 or (status is not None and status not in (429, 500, 502, 503, 504)):
++                    raise
++                wait = 2 ** attempt * 5
++                print(f"LLM API error ({e.__class__.__name__}), retry in {wait}s")
++                time.sleep(wait)
+ 
+     def load_documents(self, md_paths):
+         """โหลดเอกสาร Markdown และแบ่งเป็น chunks"""
+@@ -137,6 +172,9 @@
+             loader = TextLoader(path)
+             pages.extend(loader.load())
+ 
++        # [F4] เก็บเอกสารเต็มไว้ให้ LLM เห็นตอนสร้าง context ของแต่ละ chunk
++        self.full_docs = {page.metadata["source"]: page.page_content for page in pages}
++
+         # แปลง Langchain Documents เป็น LlamaIndex Documents
+         llama_docs = []
+         for page in pages:
+@@ -146,16 +184,23 @@
+             )
+             llama_docs.append(llama_doc)
+ 
+-        # ใช้ MarkdownNodeParser แบ่ง chunks
+-        chunks = self.md_parser.get_nodes_from_documents(llama_docs)
++        # [F2] ใช้ MarkdownNodeParser แบ่งตามหัวข้อ แล้ว SentenceSplitter ซอยส่วนที่ยาวเกิน chunk_size
++        sections = self.md_parser.get_nodes_from_documents(llama_docs)
++        chunks = self.splitter(sections)
+ 
++        # [F3] ชื่อเอกสาร (หัวข้อ # บรรทัดแรก) ของแต่ละไฟล์ ใส่ไว้หัว chunk ให้รู้ว่าเป็นของโรคไหน
++        titles = {page.metadata["source"]: page.page_content.lstrip().split("\n", 1)[0].lstrip("# ").strip()
++                  for page in pages}
++
+         print(f"Split documents into {len(chunks)} chunks")
+ 
+         # แปลง LlamaIndex Nodes กลับเป็น Langchain Documents
+         lc_chunks = []
+         for chunk in chunks:
++            title = titles[chunk.metadata["source"]]
++            text = chunk.text if chunk.text.lstrip().startswith("# " + title) else f"[{title}]\n{chunk.text}"
+             lc_doc = LangchainDocument(
+-                page_content=chunk.text,
++                page_content=text,
+                 metadata=chunk.metadata
+             )
+             lc_chunks.append(lc_doc)
+@@ -173,14 +218,16 @@
+ {chunk_content}
+ </chunk>
+ 
+-Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval. Answer only with the succinct context and nothing else.
++Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval. Answer in the same language as the document. Answer only with the succinct context and nothing else.
+ """
+         return prompt
+ 
+     def generate_context(self, document_content, chunk_content):
+         """สร้างบริบทโดยใช้ Qwen API"""
+         prompt = self.get_context_prompt(document_content, chunk_content)
+-        context = self.call_qwen_api(prompt, max_tokens=100, temperature=0.1)
++        # [F7] max_tokens 100 -> 1000: โมเดลที่ "คิด" ก่อนตอบใช้ token หมดก่อนได้คำตอบ (ได้ context ว่าง)
++        #      prompt ขอคำตอบสั้นอยู่แล้ว โมเดลที่ไม่คิด (เช่น Qwen) จึงตอบยาวเท่าเดิม
++        context = self.call_qwen_api(prompt, max_tokens=1000, temperature=0.1)
+         return context.strip()
+ 
+     def add_documents_with_context(self, docs):
+@@ -196,7 +243,8 @@
+         for i, doc in enumerate(docs):
+             # หาเอกสารเต็ม
+             doc_source = doc.metadata.get("source", "")
+-            full_doc_content = doc.page_content  # ถ้าไม่มีเอกสารเต็ม ใช้ chunk เอง
++            # [F4] ของเดิม full_doc_content = doc.page_content คือส่ง chunk ไปแทนเอกสารเต็ม
++            full_doc_content = self.full_docs.get(doc_source, doc.page_content)  # ถ้าไม่มีเอกสารเต็ม ใช้ chunk เอง
+             
+             # สร้างบริบทสำหรับ chunk นี้
+             context = self.generate_context(full_doc_content, doc.page_content)
+@@ -306,7 +354,7 @@
+         doc_sources = {}
+ 
+         for ranker_id, results in enumerate(rankings):
+-            for rank, (doc_id, score, source) in enumerate(results):
++            for rank, (doc_id, score, source) in enumerate(results, 1):  # [F8] อันดับเริ่มที่ 1 ตามสูตร RRF
+                 if doc_id not in fused_scores:
+                     fused_scores[doc_id] = 0
+                     doc_sources[doc_id] = source
+@@ -336,16 +384,13 @@
+         return fused_results[:k]
+ 
+     def truncate_context(self, context, max_tokens=4000):
+-        """ย่อ context ให้มีขนาดไม่เกิน max_tokens"""
+-        words = context.split()
+-        estimated_tokens = len(words) * 1.3
+-        
+-        if estimated_tokens <= max_tokens:
++        """ย่อ context ให้มีขนาดไม่เกิน max_tokens
++        [F9] ของเดิมประมาณ token จากจำนวนคำที่คั่นด้วยช่องว่าง x 1.3 ซึ่งใช้กับภาษาไทยไม่ได้
++             (ไทยไม่เว้นวรรคระหว่างคำ -> ประมาณต่ำไปหลายเท่า จึงไม่เคยย่อจริง) ตอนนี้นับด้วย tokenizer จริง"""
++        ids = self.tokenizer.encode(context, add_special_tokens=False)
++        if len(ids) <= max_tokens:
+             return context
+-        
+-        target_words = int(max_tokens / 1.3)
+-        truncated_context = " ".join(words[:target_words])
+-        return truncated_context + " ...(truncated)"
++        return self.tokenizer.decode(ids[:max_tokens]) + " ...(truncated)"
+ 
+     def search_for_question(self, question, k=5):
+         """ค้นหาเอกสารที่เกี่ยวข้องกับคำถามและสร้างคำตอบ"""
+@@ -402,32 +447,19 @@
+ 
+         return self.call_qwen_api(prompt, max_tokens=max_tokens, temperature=0.6)
+ 
+-# ฟังก์ชันดาวน์โหลด corpus
+-def download_corpus():
+-    import urllib.request
+-    import os
+-
+-    os.makedirs('./corpus_input', exist_ok=True)
+-
+-
+ # ฟังก์ชันหลักสำหรับรันระบบ
+ def main():
+     # ตรวจสอบ API key
+-    if "OPENROUTER_API_KEY" not in os.environ:
++    if "OPENROUTER_API_KEY" not in os.environ and "LLM_API_KEY" not in os.environ:
+         print("Error: OPENROUTER_API_KEY environment variable is not set")
+         print("Please set it with: export OPENROUTER_API_KEY='your_api_key_here'")
+         return
+ 
+-    # ดาวน์โหลด corpus
+-    download_corpus()
++    # หา corpus_input ข้างไฟล์นี้ หรือโฟลเดอร์แม่ (ของเดิมใช้ ./corpus_input ต้องรันจากโฟลเดอร์เดียวกันเท่านั้น)
++    here = Path(__file__).resolve().parent
++    corpus = next(p for p in (here / "corpus_input", here.parent / "corpus_input") if p.exists())
++    md_paths = [str(corpus / name) for name in ["1.md", "2.md", "44.md", "5555.md"]]
+ 
+-    md_paths = [
+-        "./corpus_input/1.md",
+-        "./corpus_input/2.md",
+-        "./corpus_input/44.md",
+-        "./corpus_input/5555.md",   
+-    ]
+-
+     # ตั้งค่าระบบ Contextual RAG แบบ Anthropic
+     rag = AnthropicStyleContextualRAG(
+         opensearch_host="localhost",  # OpenSearch IP ตามที่ให้ไว้
+@@ -438,7 +470,8 @@
+     docs = rag.load_documents(md_paths)
+     print(f"Loaded {len(docs)} documents")
+ 
+-    # เพิ่มเอกสารเข้า OpenSearch พร้อมสร้างบริบท
++    # เพิ่มเอกสารเข้า OpenSearch พร้อมสร้างบริบท (สร้าง index ใหม่ทุกครั้ง [F5])
++    rag.reset_indices()
+     rag.add_documents_with_context(docs)
+ 
+     # ทดสอบค้นหาและตอบคำถาม
