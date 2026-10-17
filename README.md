@@ -33,19 +33,6 @@ results/                      ← ผลวัดต้นฉบับ / ฉบ�
 corpus_input/                 ← เอกสาร 4 ไฟล์จาก repo อาจารย์
 ```
 
-## ติดตั้ง
-
-ทดสอบกับ Python 3.11 และต้องมี Docker
-
-```bash
-python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-docker run -d --name opensearch -p 9200:9200 -e "discovery.type=single-node" -e "DISABLE_SECURITY_PLUGIN=true" opensearchproject/opensearch:2.19.1
-export OPENROUTER_API_KEY='your_api_key_here'          # ต้องใช้กับขั้นที่ 1-2 เท่านั้น
-```
-
-ครั้งแรกจะโหลด `BAAI/bge-m3` อัตโนมัติ (ประมาณ 2 GB)
-
 ## วิธีรัน
 
 รันทุกคำสั่งจากโฟลเดอร์บนสุดของ repo
