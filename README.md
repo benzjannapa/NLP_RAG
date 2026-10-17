@@ -1,6 +1,6 @@
-# บันทึกการแก้ไข Authentic RAG (โค้ดอาจารย์ → ฉบับแก้)
+# บันทึกการแก้ไข Authentic RAG
 
-**งาน KDAI NLP Assignment: repo นี้ตอบโจทย์แต่ละข้อที่ไหน**
+**งาน KDAI NLP Assignment repo **
 - **ข้อ 1 ระบบ RAG ตามสไลด์:** ใช้โค้ดของอาจารย์ ([aekanun2020/2025-authenticRAG](https://github.com/aekanun2020/2025-authenticRAG)) เป็นฐาน ผลวัดของระบบต้นฉบับอยู่ที่ [results/diagnosis_2025-authenticRAG.md](results/diagnosis_2025-authenticRAG.md)
 - **ข้อ 2 ปรับปรุงโดยไม่เปลี่ยน LLM:** โค้ดที่แก้อยู่ใน [authenticRAG_fixed/](authenticRAG_fixed/)
   - chunking: [F2] [F3]
