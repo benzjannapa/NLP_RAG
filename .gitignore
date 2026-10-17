@@ -1,0 +1,5 @@
+.env
+.venv/
+__pycache__/
+# repo อาจารย์ที่ clone มาเพื่อวัดผลต้นฉบับ (README ขั้นที่ 4)
+2025-authenticRAG/

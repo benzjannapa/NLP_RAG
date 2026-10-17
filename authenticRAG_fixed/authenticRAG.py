@@ -77,10 +77,14 @@ class AnthropicStyleContextualRAG:
         โดยนับ token ด้วย tokenizer ของ bge-m3 ตัวเดียวกับที่ใช้ embed"""
         tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-m3')
         self.md_parser = MarkdownNodeParser()
-        self.splitter = SentenceSplitter(
+        self.chunk_size, self.chunk_overlap = chunk_size, chunk_overlap
+        self.chunk_tokenize = lambda text: tokenizer.encode(text, add_special_tokens=False)
+
+    def make_splitter(self, chunk_size):
+        return SentenceSplitter(
             chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            tokenizer=lambda text: tokenizer.encode(text, add_special_tokens=False),
+            chunk_overlap=self.chunk_overlap,
+            tokenizer=self.chunk_tokenize,
             # ตัวตัดประโยคค่าเริ่มต้น (NLTK punkt) ใช้กับภาษาอังกฤษ ภาษาไทยใช้ช่องว่าง/ขึ้นบรรทัดคั่นประโยค
             chunking_tokenizer_fn=lambda text: re.findall(r"\S+\s*", text),
         )
@@ -186,11 +190,22 @@ class AnthropicStyleContextualRAG:
 
         # [F2] ใช้ MarkdownNodeParser แบ่งตามหัวข้อ แล้ว SentenceSplitter ซอยส่วนที่ยาวเกิน chunk_size
         sections = self.md_parser.get_nodes_from_documents(llama_docs)
-        chunks = self.splitter(sections)
 
         # [F3] ชื่อเอกสาร (หัวข้อ # บรรทัดแรก) ของแต่ละไฟล์ ใส่ไว้หัว chunk ให้รู้ว่าเป็นของโรคไหน
         titles = {page.metadata["source"]: page.page_content.lstrip().split("\n", 1)[0].lstrip("# ").strip()
                   for page in pages}
+
+        chunks = []
+        for source, title in titles.items():
+            own = [section for section in sections if section.metadata["source"] == source]
+            # SentenceSplitter หักความยาว metadata (path ไฟล์, header_path) ออกจาก chunk_size ก่อนตัด
+            # -> จำนวน chunk ขึ้นกับว่าเก็บไฟล์ไว้ที่ path ไหน จึงตัด metadata ออกจากการคำนวณ (เนื้อหาที่ embed ไม่ได้รวม metadata)
+            for section in own:
+                section.excluded_embed_metadata_keys = list(section.metadata)
+                section.excluded_llm_metadata_keys = list(section.metadata)
+            # กันที่ไว้ให้ชื่อเอกสารที่จะใส่หัว chunk ขนาดรวมจึงไม่เกิน chunk_size
+            reserve = len(self.chunk_tokenize(f"[{title}]\n"))
+            chunks.extend(self.make_splitter(self.chunk_size - reserve)(own))
 
         print(f"Split documents into {len(chunks)} chunks")
 

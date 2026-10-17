@@ -1,0 +1,12 @@
+# เวอร์ชันที่ทดสอบแล้ว (Python 3.11)
+opensearch-py==3.2.0
+sentence-transformers==6.1.0
+transformers==5.18.0
+torch==2.14.1
+openai==3.24.0
+numpy==1.26.4
+tqdm==4.70.1
+llama-index-core==0.14.25
+# authenticRAG.py ใช้ langchain.schema และ TextLoader ซึ่งมีเฉพาะ langchain รุ่นเก่า
+langchain==0.0.354
+langchain-community==0.0.13
